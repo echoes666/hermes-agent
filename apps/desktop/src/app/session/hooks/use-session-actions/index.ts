@@ -171,6 +171,7 @@ import {
   withoutEarlyClarifyProjection
 } from './restore-pending-clarify'
 import { projectPendingConnection, restorePendingConnectionFromSnapshot } from './restore-pending-connection'
+import { activateResumeGateway } from './resume-activation'
 import {
   activatedTurnAdmission,
   type GraftedTranscriptPage,
@@ -180,13 +181,7 @@ import {
   rereadPageAfterResumeBarrier
 } from './resume-barrier-reread'
 import { clearResumeLatches, clearResumeToasts, notifyResumeFailed, type ResumeAttemptOptions } from './resume-latches'
-import {
-  ambientResumeConnectionId,
-  openResumeGateway,
-  primaryResumeParams,
-  rememberResolvedResumeOwner,
-  resolveResumeOwner
-} from './resume-owner'
+import { ambientResumeConnectionId, primaryResumeParams } from './resume-owner'
 import {
   livePromptStreamId,
   liveTurnSettledDuringResume,
@@ -372,6 +367,8 @@ export function useSessionActions({
 
   useEffect(
     () => () => {
+      resumeRequestRef.current += 1
+
       if (pendingGuardTimeoutRef.current != null) {
         clearTimeout(pendingGuardTimeoutRef.current)
       }
@@ -1174,6 +1171,7 @@ export function useSessionActions({
         return
       }
 
+      const explicitOwner = capturedOwner && { ...capturedOwner }
       const requestId = resumeRequestRef.current + 1
       const routeToken = getRouteToken()
       resumeRequestRef.current = requestId
@@ -1293,11 +1291,7 @@ export function useSessionActions({
       //
       // Only the REMEMBERED hint is validated (remembered-owner.ts); an explicitly captured owner
       // (requestSessionResume with a row route, a plugin open) is authoritative as given.
-      const rememberedOwner = capturedOwner ? undefined : rememberedOwnerForResume(storedSessionId)
-
-      // An explicit capture outranks the remembered hint; the hint only
-      // fills in when the caller had no route to give.
-      const ownerRoute = capturedOwner || rememberedOwner
+      const ownerRoute = explicitOwner ?? rememberedOwnerForResume(storedSessionId)
 
       // Capture the list's source connection before the async metadata lookup.
       const ambientConnectionId = ambientResumeConnectionId()
@@ -1330,25 +1324,22 @@ export function useSessionActions({
         }
       }
 
-      const storedForProfile = await resolveStoredSession(storedSessionId, ownerRoute)
-      const sessionProfile = storedForProfile?.profile
+      const activation = await activateResumeGateway({
+        activeSessionIdRef,
+        ambientConnectionId,
+        isCurrentResume,
+        options,
+        ownerRoute,
+        paint: scope => provisional.paint(scope),
+        resumeFailed: copy.resumeFailed,
+        storedSessionId
+      })
 
-      if (!isCurrentResume()) {
+      if (!activation?.isCurrent()) {
         return
       }
 
-      const { resolvedConnectionId, sessionOwner } = resolveResumeOwner(
-        ownerRoute,
-        storedForProfile,
-        ambientConnectionId
-      )
-
-      rememberResolvedResumeOwner(storedSessionId, ownerRoute, storedForProfile, sessionOwner)
-
-      const sessionRestScope = transcriptRestScope(ownerRoute, storedForProfile, ambientConnectionId)
-      provisional.paint(sessionRestScope)
-
-      await openResumeGateway(resolvedConnectionId, ownerRoute, sessionProfile)
+      const { sessionOwner, sessionProfile, sessionRestScope, storedForProfile } = activation
 
       // Request-time routing guard for every session-scoped RPC below. The
       // await above REQUESTS the swap, but by dispatch time the active gateway
@@ -1364,10 +1355,6 @@ export function useSessionActions({
       // requestForSessionProfile re-resolves the route at each call.
       const requestForSession = <T>(method: string, params: Record<string, unknown> = {}): Promise<T> =>
         requestForSessionProfile<T>(sessionOwner, requestGateway, method, params)
-
-      if (!isCurrentResume()) {
-        return
-      }
 
       // Re-check after the profile-resolve / gateway-swap awaits above: the
       // cache may have changed, and takeWarmCache re-validates belongs-to and
